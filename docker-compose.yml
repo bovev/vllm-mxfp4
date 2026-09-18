@@ -106,6 +106,12 @@ services:
       HIP_VISIBLE_DEVICES: "${GPUS:-0,1}"
       # vLLM usage telemetry. Off by default here; set VLLM_NO_USAGE_STATS=0 to re-enable.
       VLLM_NO_USAGE_STATS: "${VLLM_NO_USAGE_STATS:-1}"
+      # Offline while serving (HARDENING.md): the model is a local /models path, so a missing
+      # file must fail loudly instead of being downloaded. Downloads belong to
+      # ./docker-compose-setup.sh --download, the only step that ever sees HF_TOKEN.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
       # AITER: unified attention ON, every other AITER path OFF (LINEAR=1 crashes on gfx1201).
       VLLM_ROCM_USE_AITER: "1"
       VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: "1"
@@ -180,9 +186,13 @@ services:
       - SYS_NICE              # numactl mempolicy syscalls (only needed if you enable RADIANCE_NUMA_BIND)
     security_opt:
       - seccomp=unconfined
-    ipc: host
+    # A sized private /dev/shm instead of the host IPC namespace (HARDENING.md); raise it if
+    # RCCL runs short. Only restore `ipc: host` if testing proves it is needed.
+    shm_size: "${SHM_SIZE:-4g}"
     ports:
-      - "8000:8000"
+      # Loopback only by default. BIND_ADDR=<the server's LAN IP> exposes it on the LAN; never
+      # every interface without a host firewall in front of it.
+      - "${BIND_ADDR:-127.0.0.1}:8000:8000"
     volumes:
       # override any of these via the shell or a .env file (e.g. MODELS=/data/models)
       - ${MODELS:-./models}:/models:ro           # holds your model at Qwen/Qwen3.8-27B-FP8 (matches command: below)

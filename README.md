@@ -33,6 +33,7 @@ path, with what each step costs and what to do when one of them stops.
 - [Running the server](#running-the-server)
 - [ParoQuant (int4 W4A8 and int5 W5A8)](#paroquant-int4-w4a8-and-int5-w5a8)
 - [Configuration](#configuration)
+- [Security hardening](#security-hardening)
 - [Troubleshooting](#troubleshooting)
 - [Performance](#performance)
 - [How the MXFP4 path works](#how-the-mxfp4-path-works)
@@ -179,7 +180,7 @@ Serving the plain FP8 checkpoint instead, through `docker compose`, is
 |---|---|
 | **GPU** | An AMD RDNA4 (gfx1201) card. The image is compiled for gfx1201 only. One card works; four work. See [GPU and TP detection](#gpu-and-tp-detection) |
 | **Host OS** | Linux with the amdgpu kernel driver, exposing `/dev/kfd` and `/dev/dri`. ROCm userspace lives inside the image |
-| **Runtime** | podman (preferred and best exercised; the launcher uses `--replace` and `keep-groups`) or docker. Auto-detected, and `RUNTIME=` overrides. Docker users have [`docker-quickstart.sh`](#docker-one-command) |
+| **Runtime** | podman (preferred and best exercised; the launcher uses `keep-groups`) or docker. Auto-detected, and `RUNTIME=` overrides. Docker users have [`docker-quickstart.sh`](#docker-one-command) |
 | **Disk** | ~60 GiB for a full setup: 19 source + 19 built checkpoint + 2 drafter + ~10 image. The source download is deletable afterwards, and setup prints the command |
 | **Host Python / ROCm / HF CLI** | Not needed. Setup runs everything that needs them inside the image |
 
@@ -488,12 +489,14 @@ of overrides produces without running it.
 | `SNAP` | `$MODELS/Qwen3.8-27B-MXFP4-mtpfp8` | The target checkpoint |
 | `DRAFTER` | `$MODELS/Qwen3.8-27B-DFlash2-FP8` | The `dflash` drafter |
 | `PORT` | `8080` | Listen port |
-| `NAME` | `vllmmxfp4074` | Container name (historical; `podman logs -f <name>` uses it) |
-| `IMAGE` | `stilldeadcode/vllm-radiance:0.9.3` | Container image. **Moves with `CACHE`** |
+| `BIND_ADDR` | `127.0.0.1` | Host address the port is published on. The server's LAN IP exposes it on the LAN; `0.0.0.0` is refused without `ALLOW_ALL_INTERFACES=1`. See [Security hardening](#security-hardening) |
+| `NAME` | `vllm-mxfp4-qwen38` | Container name. Only a container this launcher started (label `io.vllm-mxfp4.managed=1`) is ever replaced |
+| `IMAGE` | `PIN_IMAGE` from `deploy-pins.env`, else `stilldeadcode/vllm-radiance:0.9.3` | Container image, by digest once pinned (`./pin-deployment.sh`). **Moves with `CACHE`** |
 | `CACHE` | `~/.radiance-cache-w4a8-093` + suffixes | Compile cache. Keyed on model, torch/Triton version **and** every knob that changes the traced graph. Never share one across configurations |
 | `RUNTIME` | auto | `podman` (preferred) or `docker` |
 | `CHAT_TEMPLATE` | `./qwen-fixed-v22.3.jinja` | Mounted by path, so it must exist on the host |
-| `HF_CACHE` | `~/.cache/huggingface` | Mounted for tokenizer files |
+| `HF_CACHE` | `~/.cache/huggingface` | Mounted read-only for tokenizer files (`HF_CACHE_RW=1` makes it writable) |
+| `SHM_SIZE` / `CAP_SYS_PTRACE` / `SECCOMP_UNCONFINED` / `CAP_DROP_ALL` | `4g` / `1` / `1` / `0` | The container security boundary; see [Security hardening](#security-hardening) |
 | `DRY_RUN` / `PREPARE_ONLY` | off | Print the command instead of running / do the one-time work and stop |
 
 ### Serving shape
@@ -569,6 +572,25 @@ content. The patch targets the engine, so it applies under either parser name.
 `RADIANCE_MXFP4_CHECKALL`, `_SHADOW`, `_KERNEL_NK`, `_PERBLOCK_NK`, `_MHIST`,
 `RADIANCE_GDN_NANTRACE` and `PROFILE_DIR` are unset by default and documented where they are read in
 `serve-mxfp4.sh`. The full image-level knob reference is in [DOCKERHUB.md](DOCKERHUB.md).
+
+## Security hardening
+
+The launchers run the server without `--privileged`, `--network=host` or `--ipc=host`. The GPU is
+reached through `/dev/kfd`, `/dev/dri` and the render/video groups, `/dev/shm` is a sized private
+mount (`SHM_SIZE=4g`), and the API is published on one host address (`BIND_ADDR=127.0.0.1`).
+Models, the Hugging Face cache, the repo (`/patches`) and libr4d are mounted read-only, and only
+the compile cache is writable. The server runs offline with no HF token. The image, repo commit
+and model revisions are pinned in `deploy-pins.env`.
+
+```bash
+./pin-deployment.sh            # record repo commit + image digest (+ model revisions)
+DRY_RUN=1 ./serve-mxfp4.sh     # print the security boundary and the command; starts/removes nothing
+./verify-hardening.sh          # check the running container: privileges, namespaces, mounts, port
+./review-update.sh             # before any update: what changed, and every risky added line
+```
+
+[HARDENING.md](HARDENING.md) has the full boundary, the knobs for relaxing one permission at a
+time, the second-stage tests and the update workflow.
 
 ## Troubleshooting
 
@@ -985,6 +1007,8 @@ modules the recipes do not pre-bake).
 | `docker-quickstart.sh` | The guided path: host checks, setup, start, wait for `/health`, test request. Also `status` / `logs` / `test` / `stop` / `restart` / `clean`. Wraps the two scripts below |
 | `setup-mxfp4.sh` | One-time setup: host check, image, checkpoints, kernels. Idempotent |
 | `serve-mxfp4.sh` | The launcher. `--help` for the knobs, `DRY_RUN=1` to see the command it builds, `DETACH=1` to background it |
+| `deploy-pins.env`, `pins.sh` | The deployment pins (repo commit, image digest, HF revisions) and the helper that reads/writes them |
+| `pin-deployment.sh`, `verify-hardening.sh`, `review-update.sh` | Record the pins; check a running container against the hardening boundary; review an update before serving it. See [HARDENING.md](HARDENING.md) |
 | `serve-tp1.sh`, `serve-tp2.sh`, `serve-tp3.sh` | One-line wrappers that pin the tensor-parallel size; everything else passes through |
 | `patch_gdn_lazy.py`, `radiance_gdn_lazy.py` | Lazy GDN state snapshots (`RADIANCE_GDN_LAZY`, default OFF — corrupts multi-turn chat): the vLLM patch and the materialize glue. Applied only when the knob is set, and only at TP=1 |
 | `r4d_radiance_extras{,_rx9,_rx10}.patch` | This repo's libr4d additions on top of the pinned commit: rx6 (TP>=2), rx9 (narrow-state GDN, TP=1), rx10 (rx9 + lazy snapshots, TP=1) |

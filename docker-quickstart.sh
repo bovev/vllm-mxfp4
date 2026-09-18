@@ -25,11 +25,19 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------- knobs
 # All of these are the launcher's own variables, so anything set here is also what serve-mxfp4.sh
 # sees. Nothing in this file is a second source of truth for a default.
+# shellcheck source=pins.sh
+. "$SCRIPT_DIR/pins.sh"
+pins_load
 RUNTIME=${RUNTIME:-docker}
 PORT=${PORT:-8080}
 MODELS=${MODELS:-$HOME/models}
-NAME=${NAME:-vllmmxfp4074}
-IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
+NAME=${NAME:-vllm-mxfp4-qwen38}
+IMAGE=${IMAGE:-${PIN_IMAGE:-stilldeadcode/vllm-radiance:0.9.3}}
+# The API is published on BIND_ADDR only (loopback unless you say otherwise; serve-mxfp4.sh
+# enforces the same rules). API_HOST is where this script reaches it from the host.
+BIND_ADDR=${BIND_ADDR:-127.0.0.1}
+if [ "$BIND_ADDR" = 0.0.0.0 ] || [ "$BIND_ADDR" = "::" ]; then API_HOST=127.0.0.1; else API_HOST=$BIND_ADDR; fi
+MANAGED_LABEL=io.vllm-mxfp4.managed
 # A first start compiles Triton and inductor kernels before the engine comes up, which is several
 # minutes of looking idle; later starts reuse that cache. This is a ceiling on how long we WATCH,
 # not an expected duration -- nothing is killed when it expires, we just stop polling.
@@ -71,7 +79,8 @@ Options:
 
 Environment (the launcher's own variables -- see ./serve-mxfp4.sh --help for the rest):
   MODELS=~/models   where the checkpoints go            RUNTIME=docker  docker or podman
-  IMAGE=...:0.9.3   container image                     NAME=...        container name
+  IMAGE=<pinned>    container image (deploy-pins.env)   NAME=...        container name
+  BIND_ADDR=127.0.0.1  host address the API is published on (LAN IP to expose it on the LAN)
   TP=1|2|3          tensor-parallel size (auto)         GPUS=0,1        HIP indices to serve on
                     (one card: ./serve-tp1.sh has the same effect -- README "One card (TP=1)")
 
@@ -123,7 +132,7 @@ try:
 except Exception:
     sys.exit(1)
 PY
-  else "${RT[@]}" exec "$NAME" curl -fsS --max-time 10 "${url/localhost/127.0.0.1}" 2>/dev/null
+  else "${RT[@]}" exec "$NAME" curl -fsS --max-time 10 "${url/$API_HOST/127.0.0.1}" 2>/dev/null
   fi
 }
 http_post_json() { # url json -> body on stdout
@@ -141,14 +150,21 @@ except Exception:
 PY
   else
     "${RT[@]}" exec "$NAME" curl -fsS --max-time 180 -H 'Content-Type: application/json' \
-      -d "$body" "${url/localhost/127.0.0.1}" 2>/dev/null
+      -d "$body" "${url/$API_HOST/127.0.0.1}" 2>/dev/null
   fi
 }
-port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-health_ok()  { http_get "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }
+port_open() { (exec 3<>"/dev/tcp/$API_HOST/$1") 2>/dev/null; }
+health_ok()  { http_get "http://$API_HOST:$PORT/health" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------- container state
 container_exists()  { "${RT[@]}" inspect "$NAME" >/dev/null 2>&1; }
+# Started by serve-mxfp4.sh (it labels its containers). Anything else of the same name is left alone.
+container_owned()   { [ "$("${RT[@]}" inspect -f "{{index .Config.Labels \"$MANAGED_LABEL\"}}" "$NAME" 2>/dev/null)" = 1 ]; }
+require_owned() {
+  container_exists || return 0
+  container_owned || die "a container named $NAME exists but was not started by serve-mxfp4.sh" \
+      "refusing to touch it. Use another name: NAME=<unique> ./docker-quickstart.sh"
+}
 container_running() { [ "$("${RT[@]}" inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = true ]; }
 
 # What the server is busy with, in words, read off its own log. A first start spends most of its
@@ -173,7 +189,7 @@ log_phase() {
 # mode worth catching here rather than in whatever the user tries next.
 smoke_test() {
   local reply text
-  reply=$(http_post_json "http://127.0.0.1:$PORT/v1/chat/completions" \
+  reply=$(http_post_json "http://$API_HOST:$PORT/v1/chat/completions" \
     '{"model":"Qwen3.8","max_tokens":256,"messages":[{"role":"user","content":"Say hello in one short sentence."}]}' || true)
   if [ -z "$reply" ]; then
     warn "the request did not come back"
@@ -212,6 +228,7 @@ case "$ACTION" in
     say "  following $RT_NAME logs -f $NAME  -- Ctrl-C stops watching, not the server"
     exec "${RT[@]}" logs -f "$NAME" ;;
   stop)
+    require_owned
     if container_running; then
       "${RT[@]}" stop "$NAME" >/dev/null && ok "stopped $NAME"
     else
@@ -219,7 +236,7 @@ case "$ACTION" in
     fi
     exit 0 ;;
   clean)
-    "${RT[@]}" rm -f "$NAME" >/dev/null 2>&1 && ok "removed the container $NAME" || ok "no container to remove"
+    require_owned; "${RT[@]}" rm -f "$NAME" >/dev/null 2>&1 && ok "removed the container $NAME" || ok "no container to remove"
     say "  checkpoints in $MODELS and the compile cache in ~/.radiance-cache-* were left alone"
     say "  start again any time with: ./docker-quickstart.sh"
     exit 0 ;;
@@ -232,10 +249,10 @@ case "$ACTION" in
   status)
     if container_running; then
       if health_ok; then
-        ok "serving on http://localhost:$PORT/v1  (container $NAME)"
+        ok "serving on http://$API_HOST:$PORT/v1  (container $NAME)"
         # data[].id only -- each entry also carries a permission object with an "id" of its own,
         # so a grep for "id" lists twice as many names as the server actually serves.
-        m=$(http_get "http://127.0.0.1:$PORT/v1/models" 2>/dev/null || true)
+        m=$(http_get "http://$API_HOST:$PORT/v1/models" 2>/dev/null || true)
         if [ -n "$m" ] && have python3; then
           m=$(printf '%s' "$m" | python3 -c 'import json,sys
 try: print(" ".join(d["id"] for d in json.load(sys.stdin)["data"]))
@@ -360,6 +377,7 @@ if [ "$ACTION" != restart ] && port_open "$PORT" && ! container_running; then
       "or serve on another port: ./docker-quickstart.sh --port 8081"
 fi
 
+require_owned
 if [ "$ACTION" = restart ] && container_running; then
   "${RT[@]}" stop "$NAME" >/dev/null 2>&1 || true
   ok "stopped the running container before restarting"
@@ -381,13 +399,13 @@ step "3/5  start the server"
 if [ "$FOREGROUND" = 1 ]; then
   say "  running in this terminal (Ctrl-C stops the server)"
   echo
-  exec env RUNTIME="$RUNTIME" MODELS="$MODELS" IMAGE="$IMAGE" PORT="$PORT" NAME="$NAME" \
+  exec env RUNTIME="$RUNTIME" MODELS="$MODELS" IMAGE="$IMAGE" PORT="$PORT" NAME="$NAME" BIND_ADDR="$BIND_ADDR" \
     "$SCRIPT_DIR/serve-mxfp4.sh"
 fi
 # The launcher's own [run] lines say which kernels, KV pin and cache directory this serve got,
 # which is the first thing anyone needs when something looks wrong -- worth keeping. The only
 # thing dropped is the bare container id `-d` prints last.
-RUNTIME="$RUNTIME" MODELS="$MODELS" IMAGE="$IMAGE" PORT="$PORT" NAME="$NAME" DETACH=1 \
+RUNTIME="$RUNTIME" MODELS="$MODELS" IMAGE="$IMAGE" PORT="$PORT" NAME="$NAME" BIND_ADDR="$BIND_ADDR" DETACH=1 \
   "$SCRIPT_DIR/serve-mxfp4.sh" | sed -e '/^[0-9a-f]\{12,\}$/d' -e 's/^/  /'
 ok "container $NAME started in the background"
 
@@ -438,11 +456,11 @@ smoke_test || true
 
 cat <<EOF
 
-${B}=== serving on http://localhost:$PORT/v1 ===${RST}
+${B}=== serving on http://$API_HOST:$PORT/v1 ===${RST}
 
   An OpenAI-compatible endpoint. The model name is ${B}Qwen3.8${RST}.
 
-  curl http://localhost:$PORT/v1/chat/completions \\
+  curl http://$API_HOST:$PORT/v1/chat/completions \\
     -H 'Content-Type: application/json' \\
     -d '{"model":"Qwen3.8","messages":[{"role":"user","content":"Hello!"}]}'
 

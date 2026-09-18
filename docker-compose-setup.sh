@@ -141,8 +141,9 @@ elif [ "$DOWNLOAD" = 1 ]; then
   echo "  downloading $MODEL_REPO into $MODEL_DIR (tens of GiB; resumes if interrupted)"
   mkdir -p "$MODELS" "$HF_CACHE"
   # Downloaded inside the image, which already has huggingface_hub -- the host needs no Python
-  # environment of its own. Same approach as setup-mxfp4.sh.
-  "$RUNTIME" run --rm --network=host \
+  # environment of its own. Same approach as setup-mxfp4.sh: the default bridged network (a
+  # download needs outbound HTTPS, not the host namespace).
+  "$RUNTIME" run --rm \
     -e HF_HOME=/root/.cache/huggingface -e HF_TOKEN="${HF_TOKEN:-}" \
     -v "$HF_CACHE":/root/.cache/huggingface -v "$MODELS":/models \
     --entrypoint python3 "$IMAGE" -c '
