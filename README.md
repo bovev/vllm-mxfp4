@@ -1,5 +1,12 @@
 # vllm-radiance (MXFP4)
 
+============================================================
+original repo: https://github.com/GGZ14/vllm-mxfp4
+
+Detached from original repo for own testing purposes.
+
+=============================================================
+
 A vLLM inference server for the **AMD Radeon AI PRO R9700 (gfx1201 / RDNA4)**, packaged as a
 container image. It bundles a working ROCm + PyTorch + Triton + AITER + vLLM stack with the RDNA4
 patches and custom kernels needed to run vLLM on this card, plus RDNA4-tuned GEMM / attention /
