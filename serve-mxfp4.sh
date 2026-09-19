@@ -60,6 +60,12 @@ Everything is an environment variable; these are the ones worth knowing.
   BIND_ADDR=127.0.0.1       host address the port is published on. Loopback by default; set the
                             server's LAN IP to expose it on the LAN. 0.0.0.0 (every interface)
                             is refused unless ALLOW_ALL_INTERFACES=1 -- see HARDENING.md
+  API_KEY_FILE=~/.config/vllm-mxfp4/api-key
+                            bearer key for the /v1 API, used when the file exists (chmod 600).
+                            Mounted read-only and exported inside the container, so the key is
+                            never in `docker inspect` or the process list. Required whenever
+                            BIND_ADDR is not loopback
+  ALLOW_NO_AUTH=0           1 publishes a non-loopback BIND_ADDR without an API key (don't)
   IMAGE=<pinned digest>     container image (CACHE is keyed to it -- move both together).
                             Defaults to PIN_IMAGE from deploy-pins.env, else the :0.9.3 tag
                             (with a warning; REQUIRE_PINS=1 makes an unpinned image fatal)
@@ -273,6 +279,24 @@ if [ "$BIND_ADDR" = 0.0.0.0 ] || [ "$BIND_ADDR" = "::" ]; then
   [ "${ALLOW_ALL_INTERFACES:-0}" = 1 ] || die "BIND_ADDR=$BIND_ADDR publishes the unauthenticated API on every interface" \
       "set BIND_ADDR to the server's LAN IP instead, or ALLOW_ALL_INTERFACES=1 if a host" \
       "firewall restricts port $PORT (HARDENING.md, 'Firewall')"
+fi
+# API key. vLLM's own auth only guards /v1/*, so on the LAN it is the second layer behind the
+# host firewall allowlist (HARDENING.md, "LAN access"), never the only one. The key is a file,
+# not an env var or --api-key: it is mounted read-only and exported inside the container, which
+# keeps it out of `docker inspect`, the host process list and the DRY_RUN output.
+API_KEY_FILE=${API_KEY_FILE:-$HOME/.config/vllm-mxfp4/api-key}
+if [ -e "$API_KEY_FILE" ]; then
+  [ -s "$API_KEY_FILE" ] || die "API_KEY_FILE=$API_KEY_FILE is empty"       "create it with: (umask 077; openssl rand -hex 32 > $API_KEY_FILE)"
+  case "$(stat -c %a "$API_KEY_FILE" 2>/dev/null)" in
+    [0-7]00) ;;
+    *) die "API_KEY_FILE=$API_KEY_FILE is readable by group/other" "fix it with: chmod 600 $API_KEY_FILE" ;;
+  esac
+else
+  API_KEY_FILE=
+fi
+case "$BIND_ADDR" in 127.*|localhost|::1) BIND_LOOPBACK=1 ;; *) BIND_LOOPBACK=0 ;; esac
+if [ "$BIND_LOOPBACK" = 0 ] && [ -z "$API_KEY_FILE" ] && [ "${ALLOW_NO_AUTH:-0}" != 1 ]; then
+  die "BIND_ADDR=$BIND_ADDR exposes the API beyond this host, and no API key is configured"       "create one:  mkdir -p ~/.config/vllm-mxfp4 && (umask 077; openssl rand -hex 32 > ~/.config/vllm-mxfp4/api-key)"       "(or point API_KEY_FILE at it), and allowlist the clients in the host firewall -- HARDENING.md, 'LAN access'"
 fi
 # Where the host can reach the API (for the port probe and the printed URL).
 if [ "$BIND_ADDR" = 0.0.0.0 ] || [ "$BIND_ADDR" = "::" ]; then API_HOST=127.0.0.1; else API_HOST=$BIND_ADDR; fi
@@ -957,6 +981,7 @@ MOUNT_FLAGS=(
 )
 if [ -n "${CT_MOUNT[*]:-}" ]; then MOUNT_FLAGS+=("${CT_MOUNT[@]}"); fi
 if [ -n "$R4D_SO" ]; then MOUNT_FLAGS+=(-v "$R4D_SO:/r4d:ro,z"); fi
+if [ -n "$API_KEY_FILE" ]; then MOUNT_FLAGS+=(-v "$API_KEY_FILE:/run/secrets/vllm-api-key:ro,z"); fi
 # The runtime control socket is root-equivalent on the host; nothing here mounts it, and nothing
 # should be able to by accident.
 for m in "${MOUNT_FLAGS[@]}"; do
@@ -987,6 +1012,10 @@ if [ -n "${DRY_RUN:-}" ]; then
   echo "[dry-run] devices    /dev/kfd /dev/dri  groups: ${GROUP_FLAGS[*]:-none}"
   echo "[dry-run] security   ${SEC_FLAGS[*]}"
   echo "[dry-run] absent     --privileged --network=host (runtime socket not mounted)"
+  if [ -n "$API_KEY_FILE" ]; then echo "[dry-run] auth       API key from $API_KEY_FILE (/v1 requires Bearer)"
+  elif [ "$BIND_LOOPBACK" = 1 ]; then echo "[dry-run] auth       none (loopback only)"
+  else echo "[dry-run] auth       NONE -- ALLOW_NO_AUTH=1, the API is unauthenticated beyond this host"
+  fi
   for ((i = 1; i < ${#MOUNT_FLAGS[@]}; i += 2)); do echo "[dry-run] mount      ${MOUNT_FLAGS[$i]}"; done
   echo "[dry-run] model      $CSNAP   (HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1, no HF token)"
   echo "[dry-run] ---- full command (nothing is removed or started) ----"
@@ -1158,6 +1187,11 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run ${RT_FLAGS[@]+"${RT_FLAGS[@]}"} --name "$NA
     # hypothetical: an Aug-20 build sat there and silently served a kernel 17 hours older than
     # its own source, producing fluent-looking garbage with no error anywhere in the log.
     cd /
+    # API key from the read-only secret mount; vLLM reads VLLM_API_KEY when --api-key is unset.
+    if [ -s /run/secrets/vllm-api-key ]; then
+      VLLM_API_KEY=$(cat /run/secrets/vllm-api-key); export VLLM_API_KEY
+      echo "[radiance] API key auth enabled for /v1"
+    fi
     exec /opt/radiance_entrypoint.sh "$@"' _ \
     "$CSNAP" --served-model-name ${SERVED_NAMES:-Qwen3.8 Qwen3.6 Qwen3.8-MXFP4} --host 0.0.0.0 --port "$PORT" \
     --kv-cache-dtype fp8 --tensor-parallel-size "$TP" \

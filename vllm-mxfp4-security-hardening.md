@@ -628,6 +628,11 @@ For future remote access, prefer one of:
 - mTLS
 - API gateway
 
+> **Implemented (2026-09-19):** LAN clients get the server's LAN IP (not `0.0.0.0`), an ipset
+> allowlist in `DOCKER-USER`, and a mandatory API key (`API_KEY_FILE`) for any non-loopback
+> bind. The key alone is not enough, because vLLM only guards `/v1/*`, so the firewall is the
+> primary control. See "LAN access" in `HARDENING.md`.
+
 ---
 
 ## 20. Do not auto-update this stack

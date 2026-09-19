@@ -497,6 +497,7 @@ of overrides produces without running it.
 | `CHAT_TEMPLATE` | `./qwen-fixed-v22.3.jinja` | Mounted by path, so it must exist on the host |
 | `HF_CACHE` | `~/.cache/huggingface` | Mounted read-only for tokenizer files (`HF_CACHE_RW=1` makes it writable) |
 | `IPC_HOST` / `SHM_SIZE` / `CAP_SYS_PTRACE` / `SECCOMP_UNCONFINED` / `CAP_DROP_ALL` | `1` / `4g` / `1` / `1` / `0` | The container security boundary; see [Security hardening](#security-hardening) |
+| `API_KEY_FILE` / `ALLOW_NO_AUTH` | `~/.config/vllm-mxfp4/api-key` / `0` | Bearer key for `/v1` (required off loopback); see [Security hardening](#security-hardening) |
 | `DRY_RUN` / `PREPARE_ONLY` | off | Print the command instead of running / do the one-time work and stop |
 
 ### Serving shape
@@ -579,6 +580,8 @@ The launchers run the server without `--privileged` or `--network=host`. The GPU
 through `/dev/kfd`, `/dev/dri` and the render/video groups, and the API is published on one host
 address (`BIND_ADDR=127.0.0.1`). `--ipc=host` is kept as the one required exception: the TP=2 ROCm
 engine does not start with a private 4g `/dev/shm` (see [HARDENING.md](HARDENING.md)).
+For LAN clients (OpenCode, Open WebUI), publish on the server's LAN IP. That requires an API key
+(`API_KEY_FILE`) plus a host firewall allowlist; see "LAN access" in HARDENING.md.
 Models, the Hugging Face cache, the repo (`/patches`) and libr4d are mounted read-only, and only
 the compile cache is writable. The server runs offline with no HF token. The image, repo commit
 and model revisions are pinned in `deploy-pins.env`.

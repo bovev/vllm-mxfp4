@@ -85,6 +85,9 @@ done
 if grep -qE '^(HF_TOKEN|HUGGING_FACE_HUB_TOKEN)=.+' <<<"$env"; then fail "a Hugging Face token is passed to the serving container"
 else pass "no Hugging Face token in the environment"
 fi
+# The API key comes from the read-only /run/secrets mount, never the container env (inspectable).
+if grep -qE '^VLLM_API_KEY=' <<<"$env"; then fail "VLLM_API_KEY is in the container env (visible to docker inspect)"
+fi
 
 # ---------------------------------------------------------------- published port
 binds=$(q '{{json .HostConfig.PortBindings}}')
@@ -111,6 +114,18 @@ if command -v curl >/dev/null 2>&1; then
   if curl -fsS -m 5 "http://$api:$PORT/health" >/dev/null 2>&1; then pass "http://$api:$PORT/health answers"
   else warn "http://$api:$PORT/health does not answer (still starting?)"
   fi
+  # /v1 without a key: 401 means the key is enforced. Unauthenticated is tolerated on loopback
+  # only; anywhere else the firewall allowlist would be the sole control.
+  loopback=1
+  for ip in "${ips[@]}"; do case "$ip" in 127.*|::1) ;; *) loopback=0 ;; esac; done
+  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$api:$PORT/v1/models" 2>/dev/null)
+  case "$code" in
+    401) pass "/v1 requires an API key (401 without one)" ;;
+    200) if [ "$loopback" = 1 ]; then warn "no API key (tolerated: published on loopback only)"
+         else fail "unauthenticated API published on $host_ips (set up API_KEY_FILE, HARDENING.md)"
+         fi ;;
+    *)   warn "/v1/models returned ${code:-nothing} -- auth not checked" ;;
+  esac
 fi
 
 echo

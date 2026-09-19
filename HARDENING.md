@@ -73,8 +73,9 @@ The patch step inside the container writes only to the image's `site-packages`. 
 `/patches`. The patched vLLM is recreated on every start from the read-only repo, so a
 compromised run cannot persist changes to the code the next run executes.
 
-The API has no authentication. It is published on loopback by default. `BIND_ADDR=0.0.0.0` is
-refused unless `ALLOW_ALL_INTERFACES=1` is also set.
+The API is published on loopback by default. `BIND_ADDR=0.0.0.0` is refused unless
+`ALLOW_ALL_INTERFACES=1` is also set. `/v1` requires a bearer key when `API_KEY_FILE` exists, and a
+key is mandatory for any non-loopback `BIND_ADDR` (see "LAN access" below).
 
 ## Knobs
 
@@ -90,6 +91,8 @@ needed. Do not fall back to `--privileged` or host networking.
 | `CAP_SYS_PTRACE` | `1` | `0` drops `--cap-add SYS_PTRACE` (second stage) |
 | `SECCOMP_UNCONFINED` | `1` | `0` uses the runtime's default seccomp profile (second stage) |
 | `CAP_DROP_ALL` | `0` | `1` adds `--cap-drop ALL` (third stage) |
+| `API_KEY_FILE` | `~/.config/vllm-mxfp4/api-key` | Bearer key for `/v1`, used if the file exists (mode `600`). Mounted read-only, exported in-container; never in `docker inspect` |
+| `ALLOW_NO_AUTH` | `0` | `1` allows a non-loopback `BIND_ADDR` without a key. Don't |
 | `HF_CACHE_RW` | `0` | `1` mounts the HF cache writable. Prefer fixing the need in setup |
 | `NAME` | `vllm-mxfp4-qwen38` | Container name. Only containers labelled `io.vllm-mxfp4.managed=1` are removed or replaced |
 | `REQUIRE_PINS` | `0` | `1` refuses to start from a mutable image tag |
@@ -136,6 +139,7 @@ If step 5 or 8 fails, relax one knob, retry, and record the result in the table 
 | `--ipc=host` → `--shm-size 4g` | **fails**: engine does not finish startup. `--ipc=host` restored | 2026-09-19 |
 | read-only mounts | works (server up, with `--ipc=host`) | 2026-09-19 |
 | HF offline mode | works (server up, with `--ipc=host`) | 2026-09-19 |
+| LAN access: `BIND_ADDR=<lan-ip>` + ipset allowlist + API key | _untested_ | |
 
 ## Second stage (after the server is stable)
 
@@ -147,17 +151,99 @@ prefill, speculative decode, and C1/C2/C4/C8.
 3. `CAP_DROP_ALL=1`. Inspect first with `docker exec vllm-mxfp4-qwen38 capsh --print`, and add back
    only proven needs
 
-## LAN exposure and firewall
+## LAN access (OpenCode, Open WebUI, other computers)
 
-- Set `BIND_ADDR=<server LAN IP>`. Never publish on all interfaces without a firewall.
-- Restrict TCP to the port at the host firewall as well, allowing only the workstation or the
-  trusted subnet. Docker-published ports bypass plain `INPUT` rules; for ufw/iptables, filter in
-  the `DOCKER-USER` chain. Example:
-  `iptables -I DOCKER-USER -p tcp --dport 8080 ! -s 192.168.1.0/24 -j DROP`.
-- Check from the allowed machine (`curl http://<lan-ip>:8080/health`). Also check that other VLANs
-  and the WAN cannot reach the port.
-- For remote access use a VPN (WireGuard/Tailscale), an authenticated reverse proxy, or mTLS. Never
-  expose the endpoint directly.
+Two controls, both required. Neither is enough alone:
+
+- **Host firewall allowlist** (an ipset of client IPs). vLLM's key only guards `/v1/*`: `/health`,
+  `/metrics`, `/version`, `/tokenize` and `/detokenize` answer anyone who can reach the port, and
+  the server itself is attack surface. The firewall keeps unlisted LAN devices off the port
+  entirely.
+- **API key.** LAN IPs are easy to take over (a guest device, a compromised IoT box), and the
+  firewall does nothing about a spoofed or reassigned address. The key covers that for `/v1`.
+
+The key is sent in clear text over plain HTTP, so this is for a trusted LAN only. Remote access
+goes through a VPN (WireGuard/Tailscale). Never forward the port on the router.
+
+Publish on the server's **LAN IP**, not `0.0.0.0`. From a client the result is the same, and it
+stays off Docker bridges, VPN and other interfaces.
+
+### 1. API key (once)
+
+```bash
+mkdir -p ~/.config/vllm-mxfp4
+(umask 077; openssl rand -hex 32 > ~/.config/vllm-mxfp4/api-key)
+```
+
+The launcher refuses a key file readable by group or other. Clients use the same value. To rotate,
+replace the file and restart the server, then update the clients.
+
+### 2. Firewall allowlist (once, then one line per new client)
+
+Give every client a DHCP reservation so its IP stays fixed. Docker-published ports go through
+FORWARD, not INPUT, so **ufw and plain INPUT rules do not filter them**. The rule belongs in
+`DOCKER-USER`.
+
+```bash
+sudo apt install ipset ipset-persistent iptables-persistent
+ip -br addr                                    # LAN interface name, e.g. enp5s0
+sudo ipset create vllm-clients hash:ip
+sudo ipset add vllm-clients <main-pc-ip>
+sudo iptables -I DOCKER-USER -i <lan-if> -p tcp -m conntrack --ctorigdstport 8080 --ctdir ORIGINAL   -m set ! --match-set vllm-clients src -j DROP
+sudo netfilter-persistent save                 # ipsets and rules; the set is restored first
+```
+
+`--ctorigdstport` matches the port the client connected to, before Docker's DNAT. Adding a computer
+later does not touch the rule:
+
+```bash
+sudo ipset add vllm-clients <ip> && sudo netfilter-persistent save
+```
+
+### 3. Serve on the LAN IP
+
+```bash
+docker stop vllm-mxfp4-qwen38
+REQUIRE_PINS=1 BIND_ADDR=192.168.1.180 DRY_RUN=1 ./serve-mxfp4.sh   # publish + auth lines
+REQUIRE_PINS=1 BIND_ADDR=192.168.1.180 DETACH=1 ./serve-mxfp4.sh
+./verify-hardening.sh     # published only on 192.168.1.180; /v1 requires an API key
+```
+
+Without a key file the launcher refuses a non-loopback `BIND_ADDR`. The log shows
+`[radiance] API key auth enabled for /v1`.
+
+### 4. Verify
+
+```text
+server:          docker inspect vllm-mxfp4-qwen38 | grep -c "$(head -c 8 ~/.config/vllm-mxfp4/api-key)"   -> 0
+                 sudo ss -lntp | grep 8080                               -> only 192.168.1.180:8080
+allowed client:  curl.exe -i http://192.168.1.180:8080/health            -> 200
+                 curl.exe -i http://192.168.1.180:8080/v1/models         -> 401
+                 curl.exe -i -H "Authorization: Bearer <key>" http://192.168.1.180:8080/v1/models -> 200
+other device:    the same requests time out (even with the key); DROP counter rises in
+                 sudo iptables -L DOCKER-USER -v -n
+```
+
+### 5. Clients
+
+- **OpenCode** (`opencode.json`):
+  ```json
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {
+      "vllm": {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "vLLM MXFP4",
+        "options": { "baseURL": "http://192.168.1.180:8080/v1", "apiKey": "{env:VLLM_API_KEY}" },
+        "models": { "Qwen3.8": { "name": "Qwen3.8 MXFP4" } }
+      }
+    }
+  }
+  ```
+  Set `VLLM_API_KEY` in the user environment. Don't put the key in a committed file.
+- **Open WebUI:** Admin Settings → Connections → OpenAI API → `http://192.168.1.180:8080/v1` plus
+  the key. This also works when Open WebUI runs in Docker Desktop: its traffic leaves with the
+  host's LAN IP, which is the one in the allowlist.
 
 ## Updating (no auto-updates)
 
