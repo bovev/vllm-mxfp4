@@ -66,6 +66,10 @@ Everything is an environment variable; these are the ones worth knowing.
                             never in `docker inspect` or the process list. Required whenever
                             BIND_ADDR is not loopback
   ALLOW_NO_AUTH=0           1 publishes a non-loopback BIND_ADDR without an API key (don't)
+  NETWORK=                  Docker network to join instead of the default bridge (e.g. ai-net, for
+                            Prometheus). Its containers bypass the host firewall; the key still
+                            guards /v1, /metrics stays open to them. host/none are refused
+  NETWORK_ALIAS=vllm-server DNS name on NETWORK (scrape target: vllm-server:PORT)
   IMAGE=<pinned digest>     container image (CACHE is keyed to it -- move both together).
                             Defaults to PIN_IMAGE from deploy-pins.env, else the :0.9.3 tag
                             (with a warning; REQUIRE_PINS=1 makes an unpinned image fatal)
@@ -286,7 +290,8 @@ fi
 # keeps it out of `docker inspect`, the host process list and the DRY_RUN output.
 API_KEY_FILE=${API_KEY_FILE:-$HOME/.config/vllm-mxfp4/api-key}
 if [ -e "$API_KEY_FILE" ]; then
-  [ -s "$API_KEY_FILE" ] || die "API_KEY_FILE=$API_KEY_FILE is empty"       "create it with: (umask 077; openssl rand -hex 32 > $API_KEY_FILE)"
+  [ -s "$API_KEY_FILE" ] || die "API_KEY_FILE=$API_KEY_FILE is empty" \
+      "create it with: (umask 077; openssl rand -hex 32 > $API_KEY_FILE)"
   case "$(stat -c %a "$API_KEY_FILE" 2>/dev/null)" in
     [0-7]00) ;;
     *) die "API_KEY_FILE=$API_KEY_FILE is readable by group/other" "fix it with: chmod 600 $API_KEY_FILE" ;;
@@ -296,8 +301,21 @@ else
 fi
 case "$BIND_ADDR" in 127.*|localhost|::1) BIND_LOOPBACK=1 ;; *) BIND_LOOPBACK=0 ;; esac
 if [ "$BIND_LOOPBACK" = 0 ] && [ -z "$API_KEY_FILE" ] && [ "${ALLOW_NO_AUTH:-0}" != 1 ]; then
-  die "BIND_ADDR=$BIND_ADDR exposes the API beyond this host, and no API key is configured"       "create one:  mkdir -p ~/.config/vllm-mxfp4 && (umask 077; openssl rand -hex 32 > ~/.config/vllm-mxfp4/api-key)"       "(or point API_KEY_FILE at it), and allowlist the clients in the host firewall -- HARDENING.md, 'LAN access'"
+  die "BIND_ADDR=$BIND_ADDR exposes the API beyond this host, and no API key is configured" \
+      "create one:  mkdir -p ~/.config/vllm-mxfp4 && (umask 077; openssl rand -hex 32 > ~/.config/vllm-mxfp4/api-key)" \
+      "(or point API_KEY_FILE at it), and allowlist the clients in the host firewall -- HARDENING.md, 'LAN access'"
 fi
+# Extra Docker network (e.g. the monitoring network Prometheus scrapes on), joined under a stable
+# alias. Containers on it reach the API directly, NOT through the host firewall allowlist, so for
+# them the API key is the only guard on /v1 and /metrics, /tokenize are open. Prefer a network
+# holding only Prometheus + this server. Host / none / another container's namespace are refused:
+# the first is what the hardening removed, the others break the published port.
+NETWORK=${NETWORK:-}
+NETWORK_ALIAS=${NETWORK_ALIAS:-vllm-server}
+case "$NETWORK" in
+  host|none|container:*) die "NETWORK=$NETWORK is not allowed" \
+      "use a user-defined bridge, e.g.  docker network create ai-net" ;;
+esac
 # Where the host can reach the API (for the port probe and the printed URL).
 if [ "$BIND_ADDR" = 0.0.0.0 ] || [ "$BIND_ADDR" = "::" ]; then API_HOST=127.0.0.1; else API_HOST=$BIND_ADDR; fi
 # Whether the caller set CHUNK explicitly -- captured BEFORE the default, so the single-GPU
@@ -963,6 +981,7 @@ echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME s
 SHM_SIZE=${SHM_SIZE:-4g}
 if [ "${IPC_HOST:-1}" = 1 ]; then IPC_FLAGS=(--ipc=host); else IPC_FLAGS=(--shm-size "$SHM_SIZE"); fi
 SEC_FLAGS=("${IPC_FLAGS[@]}" -p "$BIND_ADDR:$PORT:$PORT" --label "$MANAGED_LABEL=1")
+if [ -n "$NETWORK" ]; then SEC_FLAGS+=(--network "$NETWORK" --network-alias "$NETWORK_ALIAS"); fi
 if [ "${CAP_DROP_ALL:-0}" = 1 ]; then SEC_FLAGS+=(--cap-drop ALL); fi
 if [ "${CAP_SYS_PTRACE:-1}" = 1 ]; then SEC_FLAGS+=(--cap-add SYS_PTRACE); fi
 if [ "${SECCOMP_UNCONFINED:-1}" = 1 ]; then SEC_FLAGS+=(--security-opt seccomp=unconfined); fi
@@ -1009,6 +1028,9 @@ if [ -n "${DRY_RUN:-}" ]; then
   echo "[dry-run] image      $IMAGE$(pins_image_is_pinned "$IMAGE" || echo '   <-- NOT digest-pinned')"
   echo "[dry-run] name       $NAME (label $MANAGED_LABEL=1)"
   echo "[dry-run] publish    $BIND_ADDR:$PORT -> $PORT"
+  if [ -n "$NETWORK" ]; then echo "[dry-run] network    $NETWORK (alias $NETWORK_ALIAS; its containers bypass the host firewall)"
+  else echo "[dry-run] network    default bridge"
+  fi
   echo "[dry-run] devices    /dev/kfd /dev/dri  groups: ${GROUP_FLAGS[*]:-none}"
   echo "[dry-run] security   ${SEC_FLAGS[*]}"
   echo "[dry-run] absent     --privileged --network=host (runtime socket not mounted)"
@@ -1020,6 +1042,9 @@ if [ -n "${DRY_RUN:-}" ]; then
   echo "[dry-run] model      $CSNAP   (HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1, no HF token)"
   echo "[dry-run] ---- full command (nothing is removed or started) ----"
 else
+  if [ -n "$NETWORK" ] && ! "$RUNTIME" network inspect "$NETWORK" >/dev/null 2>&1; then
+    die "NETWORK=$NETWORK does not exist" "create it (docker network create $NETWORK) or unset NETWORK"
+  fi
   remove_stale_container
 fi
 

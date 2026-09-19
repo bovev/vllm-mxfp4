@@ -505,6 +505,7 @@ of overrides produces without running it.
 | `HF_CACHE` | `~/.cache/huggingface` | Mounted read-only for tokenizer files (`HF_CACHE_RW=1` makes it writable) |
 | `IPC_HOST` / `SHM_SIZE` / `CAP_SYS_PTRACE` / `SECCOMP_UNCONFINED` / `CAP_DROP_ALL` | `1` / `4g` / `1` / `1` / `0` | The container security boundary; see [Security hardening](#security-hardening) |
 | `API_KEY_FILE` / `ALLOW_NO_AUTH` | `~/.config/vllm-mxfp4/api-key` / `0` | Bearer key for `/v1` (required off loopback); see [Security hardening](#security-hardening) |
+| `NETWORK` / `NETWORK_ALIAS` | default bridge / `vllm-server` | Join a Docker network (e.g. `ai-net` for Prometheus); see HARDENING.md, "Monitoring" |
 | `DRY_RUN` / `PREPARE_ONLY` | off | Print the command instead of running / do the one-time work and stop |
 
 ### Serving shape
