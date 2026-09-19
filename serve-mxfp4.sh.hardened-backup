@@ -934,8 +934,7 @@ echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME s
 # unconfined seccomp are KEPT by default (ROCm / AITER JIT / py-spy) and are the second-stage
 # tests: flip one knob at a time.
 SHM_SIZE=${SHM_SIZE:-4g}
-# DEBUG (bisecting startup regression): host IPC restored in place of --shm-size "$SHM_SIZE".
-SEC_FLAGS=(--ipc=host -p "$BIND_ADDR:$PORT:$PORT" --label "$MANAGED_LABEL=1")
+SEC_FLAGS=(--shm-size "$SHM_SIZE" -p "$BIND_ADDR:$PORT:$PORT" --label "$MANAGED_LABEL=1")
 if [ "${CAP_DROP_ALL:-0}" = 1 ]; then SEC_FLAGS+=(--cap-drop ALL); fi
 if [ "${CAP_SYS_PTRACE:-1}" = 1 ]; then SEC_FLAGS+=(--cap-add SYS_PTRACE); fi
 if [ "${SECCOMP_UNCONFINED:-1}" = 1 ]; then SEC_FLAGS+=(--security-opt seccomp=unconfined); fi
@@ -983,7 +982,7 @@ if [ -n "${DRY_RUN:-}" ]; then
   echo "[dry-run] publish    $BIND_ADDR:$PORT -> $PORT"
   echo "[dry-run] devices    /dev/kfd /dev/dri  groups: ${GROUP_FLAGS[*]:-none}"
   echo "[dry-run] security   ${SEC_FLAGS[*]}"
-  echo "[dry-run] absent     --privileged --network=host (runtime socket not mounted)"
+  echo "[dry-run] absent     --privileged --network=host --ipc=host (runtime socket not mounted)"
   for ((i = 1; i < ${#MOUNT_FLAGS[@]}; i += 2)); do echo "[dry-run] mount      ${MOUNT_FLAGS[$i]}"; done
   echo "[dry-run] model      $CSNAP   (HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1, no HF token)"
   echo "[dry-run] ---- full command (nothing is removed or started) ----"
