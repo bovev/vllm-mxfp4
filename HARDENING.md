@@ -93,6 +93,8 @@ needed. Do not fall back to `--privileged` or host networking.
 | `CAP_DROP_ALL` | `0` | `1` adds `--cap-drop ALL` (third stage) |
 | `API_KEY_FILE` | `~/.config/vllm-mxfp4/api-key` | Bearer key for `/v1`, used if the file exists (mode `600`). Mounted read-only, exported in-container; never in `docker inspect` |
 | `ALLOW_NO_AUTH` | `0` | `1` allows a non-loopback `BIND_ADDR` without a key. Don't |
+| `NETWORK` | _(default bridge)_ | Docker network to join, e.g. `ai-net` for Prometheus. `host`, `none` and `container:*` are refused |
+| `NETWORK_ALIAS` | `vllm-server` | DNS name on `NETWORK`, so the scrape target is `vllm-server:8080` |
 | `HF_CACHE_RW` | `0` | `1` mounts the HF cache writable. Prefer fixing the need in setup |
 | `NAME` | `vllm-mxfp4-qwen38` | Container name. Only containers labelled `io.vllm-mxfp4.managed=1` are removed or replaced |
 | `REQUIRE_PINS` | `0` | `1` refuses to start from a mutable image tag |
@@ -139,7 +141,8 @@ If step 5 or 8 fails, relax one knob, retry, and record the result in the table 
 | `--ipc=host` → `--shm-size 4g` | **fails**: engine does not finish startup. `--ipc=host` restored | 2026-09-19 |
 | read-only mounts | works (server up, with `--ipc=host`) | 2026-09-19 |
 | HF offline mode | works (server up, with `--ipc=host`) | 2026-09-19 |
-| LAN access: `BIND_ADDR=<lan-ip>` + ipset allowlist + API key | _untested_ | |
+| LAN access: `BIND_ADDR=<lan-ip>` + ipset allowlist + API key | works (Open WebUI, base URL must end in `/v1`) | 2026-09-19 |
+| `NETWORK=ai-net`: Prometheus scrape of `/metrics` without a key | _untested_ | |
 
 ## Second stage (after the server is stable)
 
@@ -244,6 +247,42 @@ other device:    the same requests time out (even with the key); DROP counter ri
 - **Open WebUI:** Admin Settings → Connections → OpenAI API → `http://192.168.1.180:8080/v1` plus
   the key. This also works when Open WebUI runs in Docker Desktop: its traffic leaves with the
   host's LAN IP, which is the one in the allowlist.
+
+## Monitoring (Prometheus on a Docker network)
+
+Prometheus scrapes `vllm-server:8080/metrics` over the Docker network `ai-net`. The launcher joins
+that network under a stable alias. Don't use `docker network connect` for this, because the
+connection is lost when the launcher replaces the container.
+
+```bash
+docker stop vllm-mxfp4-qwen38
+REQUIRE_PINS=1 BIND_ADDR=192.168.1.180 NETWORK=ai-net DRY_RUN=1 ./serve-mxfp4.sh | grep -E "network|publish|auth"
+REQUIRE_PINS=1 BIND_ADDR=192.168.1.180 NETWORK=ai-net DETACH=1 ./serve-mxfp4.sh
+```
+
+`--network ai-net` replaces the default bridge. The LAN publish (`-p BIND_ADDR:PORT`) works the
+same on a user-defined bridge.
+
+Check from inside the network, which is the path Prometheus uses:
+
+```bash
+docker run --rm --network ai-net curlimages/curl -s -o /dev/null -w '%{http_code}\n' http://vllm-server:8080/metrics    # 200: no key needed
+docker run --rm --network ai-net curlimages/curl -s -o /dev/null -w '%{http_code}\n' http://vllm-server:8080/v1/models  # 401: key enforced
+```
+
+vLLM's key only guards `/v1/*`, so the scrape job needs no credentials. If `/metrics` ever returns
+401, give the job `authorization: { type: Bearer, credentials_file: <key file mounted ro> }`.
+
+**Tradeoff.** Containers on `ai-net` reach port 8080 directly. They never pass the `DOCKER-USER`
+allowlist, which filters only the LAN interface. For them the API key is the only guard on `/v1`,
+and `/metrics`, `/tokenize` and `/health` are open. In the other direction, the vLLM container can
+reach every service on `ai-net`. The tighter setup is a network holding only Prometheus and vLLM:
+
+```bash
+docker network create vllm-metrics
+docker network connect vllm-metrics prometheus
+NETWORK=vllm-metrics ./serve-mxfp4.sh ...
+```
 
 ## Updating (no auto-updates)
 
