@@ -55,9 +55,22 @@ edited to run on a host with a different number of cards.
 
 Everything is an environment variable; these are the ones worth knowing.
 
-  MODELS=~/models           directory holding the checkpoints (bind-mounted at /models)
+  MODELS=~/models           directory holding the checkpoints (bind-mounted READ-ONLY at /models)
   PORT=8080                 listen port
-  IMAGE=...:0.9.3           container image (CACHE is keyed to it -- move both together)
+  BIND_ADDR=127.0.0.1       host address the port is published on. Loopback by default; set the
+                            server's LAN IP to expose it on the LAN. 0.0.0.0 (every interface)
+                            is refused unless ALLOW_ALL_INTERFACES=1 -- see HARDENING.md
+  API_KEY_FILE=~/.config/vllm-mxfp4/api-key
+                            bearer key for the /v1 API, used when the file exists (chmod 600).
+                            Mounted read-only and exported inside the container, so the key is
+                            never in `docker inspect` or the process list. Required whenever
+                            BIND_ADDR is not loopback
+  ALLOW_NO_AUTH=0           1 publishes a non-loopback BIND_ADDR without an API key (don't)
+  IMAGE=<pinned digest>     container image (CACHE is keyed to it -- move both together).
+                            Defaults to PIN_IMAGE from deploy-pins.env, else the :0.9.3 tag
+                            (with a warning; REQUIRE_PINS=1 makes an unpinned image fatal)
+  NAME=vllm-mxfp4-qwen38    container name. A container of that name that this launcher did
+                            not start is never removed or replaced
   RUNTIME=podman|docker     container runtime (auto-detected)
   CHAT_TEMPLATE=./qwen-fixed-v22.3.jinja
                             chat template; must be readable on the host
@@ -107,7 +120,18 @@ Everything is an environment variable; these are the ones worth knowing.
   HSA_ENABLE_INTERRUPT=0    busy-poll completion signals, ROC_ACTIVE_WAIT_TIMEOUT=<us>
   MXFP4_CUMODE=1            compile the MXFP4 GEMM .hip with -mcumode (A/B; output-identical)
   VLLM_NO_USAGE_STATS=1     vLLM usage telemetry (default off here); 0 re-enables it
-  DRY_RUN=1                 print the container command instead of running it
+  DRY_RUN=1                 print the container command and its security boundary instead of
+                            running it (removes nothing)
+
+Container security boundary (HARDENING.md). No --privileged or --network=host. --ipc=host is
+the one required exception (TP=2/ROCm fails to start with a private 4g /dev/shm, 2026-09-19).
+Change these ONE AT A TIME when testing, and record which one a failure needed.
+  IPC_HOST=1                keep --ipc=host (required); 0 uses a private /dev/shm of SHM_SIZE
+  SHM_SIZE=4g               /dev/shm size when IPC_HOST=0 (4g fails; 8g/16g untested)
+  CAP_SYS_PTRACE=1          keep --cap-add SYS_PTRACE; 0 drops it (second-stage test)
+  SECCOMP_UNCONFINED=1      keep seccomp=unconfined; 0 uses the runtime default profile
+  CAP_DROP_ALL=0            1 adds --cap-drop ALL (third-stage test; re-adds SYS_PTRACE if kept)
+  HF_CACHE_RW=0             1 mounts the Hugging Face cache writable (models/patches/r4d stay ro)
   DETACH=1                  start in the background and return (logs: RUNTIME logs -f NAME)
   PREPARE_ONLY=1            do the one-time work (image, libr4d) and stop before serving
 
@@ -132,11 +156,16 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 # a count of render nodes. Sourced rather than run so a single scan serves every default below.
 # shellcheck source=gpu-detect.sh
 . "$SCRIPT_DIR/gpu-detect.sh"
+# deploy-pins.env: the image digest (and repo commit / HF revisions) this host is pinned to.
+# shellcheck source=pins.sh
+. "$SCRIPT_DIR/pins.sh"
+pins_load
 
 # ---------------------------------------------------------------- container runtime
-# podman and docker differ in three places this script touches: `--replace` is podman-only,
-# `--group-add keep-groups` is podman-only (docker wants numeric render/video GIDs), and docker
-# needs the stale container removed by hand. Everything else is identical.
+# podman and docker differ in two places this script touches: `--group-add keep-groups` is
+# podman-only (docker wants numeric render/video GIDs), and only podman has `--replace`. Neither
+# runtime gets an unconditional replace here: a stale container is removed by hand, and only if
+# it carries MANAGED_LABEL (see remove_stale_container). Everything else is identical.
 RUNTIME=${RUNTIME:-}
 if [ -z "$RUNTIME" ]; then
   if   command -v podman >/dev/null 2>&1; then RUNTIME=podman
@@ -149,7 +178,6 @@ command -v "$RUNTIME" >/dev/null 2>&1 || die "RUNTIME=$RUNTIME is not on PATH"
 RT_FLAGS=()
 GROUP_FLAGS=()
 if [ "$RUNTIME" = podman ]; then
-  RT_FLAGS+=(--replace)
   GROUP_FLAGS+=(--group-add keep-groups)
 else
   for g in render video; do
@@ -202,7 +230,7 @@ preflight() {
   # The probe opens fd 3 in a SUBSHELL, so there is nothing to close here -- and closing it with
   # a bare `exec 3>&- 2>/dev/null` would apply that redirection to the shell itself and silence
   # every error message after it.
-  if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+  if (exec 3<>"/dev/tcp/$API_HOST/$PORT") 2>/dev/null; then
     # Name the container holding it. "stop the container you find in `podman ps`" was not
     # enough on 2026-09-01: the server on the port had been started by running its script
     # directly, so `systemctl --user stop` was a no-op against it, the port stayed held, and
@@ -228,9 +256,50 @@ preflight() {
 # Image and cache MUST move together: cache dirs validate on model + torch/Triton version and must
 # not be shared across configurations. Both defaulted to 0.7.4 / -074 long after production moved to
 # 0.9.3 / -093, so anyone taking the defaults got a DIFFERENT server than the one being measured.
-IMAGE=${IMAGE:-stilldeadcode/vllm-radiance:0.9.3}
-NAME=${NAME:-vllmmxfp4074}
+IMAGE=${IMAGE:-${PIN_IMAGE:-stilldeadcode/vllm-radiance:0.9.3}}
+# A tag is mutable: the same name can pull different bytes tomorrow. deploy-pins.env pins the digest
+# (./pin-deployment.sh records it); until then this warns, and REQUIRE_PINS=1 refuses to start.
+if ! pins_image_is_pinned "$IMAGE"; then
+  if [ "${REQUIRE_PINS:-0}" = 1 ]; then
+    die "IMAGE=$IMAGE is a mutable tag and REQUIRE_PINS=1" \
+        "pin it once with ./pin-deployment.sh (records PIN_IMAGE in deploy-pins.env)"
+  fi
+  echo "[serve-mxfp4] WARNING: IMAGE=$IMAGE is not pinned by digest -- run ./pin-deployment.sh" >&2
+fi
+# Unique, explicit name: the launcher replaces a stale container of this name, so a generic name
+# could collide with something unrelated. It only ever removes containers carrying MANAGED_LABEL.
+NAME=${NAME:-vllm-mxfp4-qwen38}
+MANAGED_LABEL=io.vllm-mxfp4.managed
 PORT=${PORT:-8080}
+case "$PORT" in ''|*[!0-9]*) die "PORT must be a number, got: $PORT" ;; esac
+# The API is published on ONE host address. vLLM itself listens on 0.0.0.0 inside the container's
+# own network namespace, which is reachable only through this publish.
+BIND_ADDR=${BIND_ADDR:-127.0.0.1}
+if [ "$BIND_ADDR" = 0.0.0.0 ] || [ "$BIND_ADDR" = "::" ]; then
+  [ "${ALLOW_ALL_INTERFACES:-0}" = 1 ] || die "BIND_ADDR=$BIND_ADDR publishes the unauthenticated API on every interface" \
+      "set BIND_ADDR to the server's LAN IP instead, or ALLOW_ALL_INTERFACES=1 if a host" \
+      "firewall restricts port $PORT (HARDENING.md, 'Firewall')"
+fi
+# API key. vLLM's own auth only guards /v1/*, so on the LAN it is the second layer behind the
+# host firewall allowlist (HARDENING.md, "LAN access"), never the only one. The key is a file,
+# not an env var or --api-key: it is mounted read-only and exported inside the container, which
+# keeps it out of `docker inspect`, the host process list and the DRY_RUN output.
+API_KEY_FILE=${API_KEY_FILE:-$HOME/.config/vllm-mxfp4/api-key}
+if [ -e "$API_KEY_FILE" ]; then
+  [ -s "$API_KEY_FILE" ] || die "API_KEY_FILE=$API_KEY_FILE is empty"       "create it with: (umask 077; openssl rand -hex 32 > $API_KEY_FILE)"
+  case "$(stat -c %a "$API_KEY_FILE" 2>/dev/null)" in
+    [0-7]00) ;;
+    *) die "API_KEY_FILE=$API_KEY_FILE is readable by group/other" "fix it with: chmod 600 $API_KEY_FILE" ;;
+  esac
+else
+  API_KEY_FILE=
+fi
+case "$BIND_ADDR" in 127.*|localhost|::1) BIND_LOOPBACK=1 ;; *) BIND_LOOPBACK=0 ;; esac
+if [ "$BIND_LOOPBACK" = 0 ] && [ -z "$API_KEY_FILE" ] && [ "${ALLOW_NO_AUTH:-0}" != 1 ]; then
+  die "BIND_ADDR=$BIND_ADDR exposes the API beyond this host, and no API key is configured"       "create one:  mkdir -p ~/.config/vllm-mxfp4 && (umask 077; openssl rand -hex 32 > ~/.config/vllm-mxfp4/api-key)"       "(or point API_KEY_FILE at it), and allowlist the clients in the host firewall -- HARDENING.md, 'LAN access'"
+fi
+# Where the host can reach the API (for the port probe and the printed URL).
+if [ "$BIND_ADDR" = 0.0.0.0 ] || [ "$BIND_ADDR" = "::" ]; then API_HOST=127.0.0.1; else API_HOST=$BIND_ADDR; fi
 # Whether the caller set CHUNK explicitly -- captured BEFORE the default, so the single-GPU
 # profile below can tell "unset" from "deliberately 8192".
 _SET_CHUNK=${CHUNK+1}
@@ -872,7 +941,7 @@ if [ "$KV_MEM" = "0" ]; then KV_MEM=""; KV_SRC=profiled; fi
 
 mkdir -p "$CACHE"/{vllm,inductor,triton,aiter}
 
-echo "[run] $RUNTIME $IMAGE | port $PORT | $SPEC_METHOD spec=$SPEC | model $CSNAP"
+echo "[run] $RUNTIME $IMAGE | http://$API_HOST:$PORT/v1 (bind $BIND_ADDR) | $SPEC_METHOD spec=$SPEC | model $CSNAP"
 echo "[run] gpus=$RAD_GPU_COUNT x $RAD_GPU_NAME ($RAD_GPU_MIB MiB) tp=$TP hip=$GPU_IDS sig=$RAD_GPU_SIG tp_pad=$TP_PAD"
 echo "[run] attn=$ATTN chunk=$CHUNK ar_max_kb=$AR_MAX_KB fast_draft=$FAST_DRAFT rerank=${RADIANCE_DRAFT_RERANK:-32} vhead=${RADIANCE_VERIFY_HEAD:-0} min_m=$MIN_M fuse_rms=${RADIANCE_FUSE_RMS_QUANT:-1} preshuf=${RADIANCE_PRESHUFFLE:-1} util=$GPU_UTIL kv_mem=${KV_MEM:-none}($KV_SRC)"
 if [ "$KV_SRC" = profiled ] && [ "$GPU_UTIL" = "0.98" ]; then
@@ -884,8 +953,75 @@ echo "[run] cache=$CACHE"
 echo "[run] chat-template=$CHAT_TEMPLATE"
 echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME stop $NAME"
 
-# docker has no --replace, so a container left behind by a previous run has to go first.
-if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || true; fi
+# ---------------------------------------------------------------- container security boundary
+# HARDENING.md has the reasoning; in short: GPU access is the two device nodes plus the render/
+# video groups, not --privileged; the API is one published port on BIND_ADDR, not the host
+# network namespace. Host IPC is the one required exception: with a private --shm-size 4g the
+# TP=2 ROCm engine never finished initialisation, with --ipc=host it serves (A/B, 2026-09-19).
+# IPC_HOST=0 is kept only to retest a private /dev/shm. SYS_PTRACE and unconfined seccomp are KEPT
+# by default (ROCm / AITER JIT / py-spy) and are the second-stage tests: flip one knob at a time.
+SHM_SIZE=${SHM_SIZE:-4g}
+if [ "${IPC_HOST:-1}" = 1 ]; then IPC_FLAGS=(--ipc=host); else IPC_FLAGS=(--shm-size "$SHM_SIZE"); fi
+SEC_FLAGS=("${IPC_FLAGS[@]}" -p "$BIND_ADDR:$PORT:$PORT" --label "$MANAGED_LABEL=1")
+if [ "${CAP_DROP_ALL:-0}" = 1 ]; then SEC_FLAGS+=(--cap-drop ALL); fi
+if [ "${CAP_SYS_PTRACE:-1}" = 1 ]; then SEC_FLAGS+=(--cap-add SYS_PTRACE); fi
+if [ "${SECCOMP_UNCONFINED:-1}" = 1 ]; then SEC_FLAGS+=(--security-opt seccomp=unconfined); fi
+
+# Everything the container can read is mounted read-only; only $CACHE (compile/JIT caches, where
+# HF_MODULES_CACHE is pointed too) is writable. The in-container patch step writes only to the
+# image's site-packages, never to /patches. HF_CACHE_RW=1 is the escape hatch if a startup phase
+# turns out to need the Hugging Face cache writable -- fix that by doing the write during setup.
+HF_MODE=ro
+if [ "${HF_CACHE_RW:-0}" = 1 ]; then HF_MODE=rw; fi
+MOUNT_FLAGS=(
+  -v "${HF_CACHE:-$HOME/.cache/huggingface}:/root/.cache/huggingface:$HF_MODE"
+  -v "$MODELS:/models:ro"
+  -v "$CACHE:/cache"
+  -v "${PATCHES:-$SCRIPT_DIR}:/patches:ro,z"
+)
+if [ -n "${CT_MOUNT[*]:-}" ]; then MOUNT_FLAGS+=("${CT_MOUNT[@]}"); fi
+if [ -n "$R4D_SO" ]; then MOUNT_FLAGS+=(-v "$R4D_SO:/r4d:ro,z"); fi
+if [ -n "$API_KEY_FILE" ]; then MOUNT_FLAGS+=(-v "$API_KEY_FILE:/run/secrets/vllm-api-key:ro,z"); fi
+# The runtime control socket is root-equivalent on the host; nothing here mounts it, and nothing
+# should be able to by accident.
+for m in "${MOUNT_FLAGS[@]}"; do
+  case "$m" in *docker.sock*|*podman.sock*|*/run/podman*|*containerd.sock*)
+    die "refusing to mount a container runtime socket: $m" ;;
+  esac
+done
+mkdir -p "$CACHE/hf_modules"
+
+# Remove a container left behind by a previous run -- but only one this launcher started. A
+# container of the same name without MANAGED_LABEL is somebody else's and is never touched.
+remove_stale_container() {
+  "$RUNTIME" container inspect "$NAME" >/dev/null 2>&1 || return 0
+  local owned
+  owned=$("$RUNTIME" container inspect -f "{{index .Config.Labels \"$MANAGED_LABEL\"}}" "$NAME" 2>/dev/null || true)
+  [ "$owned" = 1 ] || die "a container named $NAME exists and was not started by this launcher" \
+      "refusing to remove it. Inspect it:  $RUNTIME ps -a --filter name=^$NAME\$" \
+      "then remove it yourself, or serve under another name: NAME=<unique> ./serve-mxfp4.sh"
+  "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || true
+}
+
+if [ -n "${DRY_RUN:-}" ]; then
+  # What the hardening checklist asks to verify, in one place (HARDENING.md, "Dry run").
+  echo "[dry-run] ---- container security boundary ----"
+  echo "[dry-run] image      $IMAGE$(pins_image_is_pinned "$IMAGE" || echo '   <-- NOT digest-pinned')"
+  echo "[dry-run] name       $NAME (label $MANAGED_LABEL=1)"
+  echo "[dry-run] publish    $BIND_ADDR:$PORT -> $PORT"
+  echo "[dry-run] devices    /dev/kfd /dev/dri  groups: ${GROUP_FLAGS[*]:-none}"
+  echo "[dry-run] security   ${SEC_FLAGS[*]}"
+  echo "[dry-run] absent     --privileged --network=host (runtime socket not mounted)"
+  if [ -n "$API_KEY_FILE" ]; then echo "[dry-run] auth       API key from $API_KEY_FILE (/v1 requires Bearer)"
+  elif [ "$BIND_LOOPBACK" = 1 ]; then echo "[dry-run] auth       none (loopback only)"
+  else echo "[dry-run] auth       NONE -- ALLOW_NO_AUTH=1, the API is unauthenticated beyond this host"
+  fi
+  for ((i = 1; i < ${#MOUNT_FLAGS[@]}; i += 2)); do echo "[dry-run] mount      ${MOUNT_FLAGS[$i]}"; done
+  echo "[dry-run] model      $CSNAP   (HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1, no HF token)"
+  echo "[dry-run] ---- full command (nothing is removed or started) ----"
+else
+  remove_stale_container
+fi
 
 # DRY_RUN=1 prints the command instead of running it -- for checking what a set of environment
 # overrides actually produces, and for lifting the invocation into a unit file.
@@ -903,12 +1039,16 @@ if [ "$RUNTIME" != podman ]; then "$RUNTIME" rm -f "$NAME" >/dev/null 2>&1 || tr
 # coincide and nothing changes; with GPUS=1 the old "1,1" pair left the engine core with no
 # device at all ("No CUDA GPUs are available", 2026-09-16, first single-card serve on card 1).
 HIP_IDS=$(python3 -c "import sys; print(','.join(str(i) for i in range(len(sys.argv[1].split(',')))))" "$GPU_IDS")
-exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privileged --ipc=host --network=host \
-  --device /dev/kfd --device /dev/dri "${GROUP_FLAGS[@]}" \
-  --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
-  -e ROCR_VISIBLE_DEVICES="$GPU_IDS" -e HIP_VISIBLE_DEVICES="$HIP_IDS" -e HF_HUB_OFFLINE=1 \
+# Offline by construction: the model is a local /models path, HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE
+# make a missing file fail loudly instead of downloading, no HF token is passed, and HF_TOKEN_PATH
+# points away from a `token` file a host-side login may have left in the (read-only) HF cache.
+exec ${DRY_RUN:+echo} "$RUNTIME" run ${RT_FLAGS[@]+"${RT_FLAGS[@]}"} --name "$NAME" "${SEC_FLAGS[@]}" \
+  --device /dev/kfd --device /dev/dri ${GROUP_FLAGS[@]+"${GROUP_FLAGS[@]}"} \
+  -e ROCR_VISIBLE_DEVICES="$GPU_IDS" -e HIP_VISIBLE_DEVICES="$HIP_IDS" \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e HF_HUB_DISABLE_TELEMETRY=1 \
+  -e HF_TOKEN_PATH=/nonexistent/hf-token -e HF_MODULES_CACHE=/cache/hf_modules \
   -e VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}" \
-  -e VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}" \
+  -e VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}" -e DO_NOT_TRACK=1 \
   -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \
   -e VLLM_ROCM_USE_AITER_MHA=0 -e VLLM_ROCM_USE_AITER_MLA=0 -e VLLM_ROCM_USE_AITER_MOE=0 \
   -e VLLM_ROCM_USE_AITER_LINEAR=0 -e VLLM_ROCM_USE_AITER_FP8BMM=0 \
@@ -991,12 +1131,7 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
   -e RADIANCE_MXFP4_REFLINEAR="${RADIANCE_MXFP4_REFLINEAR:-0}" \
   -e VLLM_CACHE_ROOT=/cache/vllm -e TORCHINDUCTOR_CACHE_DIR=/cache/inductor -e TRITON_CACHE_DIR=/cache/triton \
   -e AITER_ROOT_DIR=/cache/aiter -e TRITON_CACHE_AUTOTUNING=1 \
-  -v "${HF_CACHE:-$HOME/.cache/huggingface}":/root/.cache/huggingface \
-  -v "$MODELS":/models \
-  -v "$CACHE":/cache \
-  -v "${PATCHES:-$SCRIPT_DIR}":/patches:z \
-  ${CT_MOUNT[@]+"${CT_MOUNT[@]}"} \
-  ${R4D_SO:+-v "$R4D_SO":/r4d:z} \
+  "${MOUNT_FLAGS[@]}" \
   ${R4D_SO:+-e R4D_SO="$R4D_SO"} \
   --entrypoint bash \
   "$IMAGE" -lc '
@@ -1052,6 +1187,11 @@ exec ${DRY_RUN:+echo} "$RUNTIME" run "${RT_FLAGS[@]}" --name "$NAME" --privilege
     # hypothetical: an Aug-20 build sat there and silently served a kernel 17 hours older than
     # its own source, producing fluent-looking garbage with no error anywhere in the log.
     cd /
+    # API key from the read-only secret mount; vLLM reads VLLM_API_KEY when --api-key is unset.
+    if [ -s /run/secrets/vllm-api-key ]; then
+      VLLM_API_KEY=$(cat /run/secrets/vllm-api-key); export VLLM_API_KEY
+      echo "[radiance] API key auth enabled for /v1"
+    fi
     exec /opt/radiance_entrypoint.sh "$@"' _ \
     "$CSNAP" --served-model-name ${SERVED_NAMES:-Qwen3.8 Qwen3.6 Qwen3.8-MXFP4} --host 0.0.0.0 --port "$PORT" \
     --kv-cache-dtype fp8 --tensor-parallel-size "$TP" \
