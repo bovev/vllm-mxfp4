@@ -496,7 +496,7 @@ of overrides produces without running it.
 | `RUNTIME` | auto | `podman` (preferred) or `docker` |
 | `CHAT_TEMPLATE` | `./qwen-fixed-v22.3.jinja` | Mounted by path, so it must exist on the host |
 | `HF_CACHE` | `~/.cache/huggingface` | Mounted read-only for tokenizer files (`HF_CACHE_RW=1` makes it writable) |
-| `SHM_SIZE` / `CAP_SYS_PTRACE` / `SECCOMP_UNCONFINED` / `CAP_DROP_ALL` | `4g` / `1` / `1` / `0` | The container security boundary; see [Security hardening](#security-hardening) |
+| `IPC_HOST` / `SHM_SIZE` / `CAP_SYS_PTRACE` / `SECCOMP_UNCONFINED` / `CAP_DROP_ALL` | `1` / `4g` / `1` / `1` / `0` | The container security boundary; see [Security hardening](#security-hardening) |
 | `DRY_RUN` / `PREPARE_ONLY` | off | Print the command instead of running / do the one-time work and stop |
 
 ### Serving shape
@@ -575,9 +575,10 @@ content. The patch targets the engine, so it applies under either parser name.
 
 ## Security hardening
 
-The launchers run the server without `--privileged`, `--network=host` or `--ipc=host`. The GPU is
-reached through `/dev/kfd`, `/dev/dri` and the render/video groups, `/dev/shm` is a sized private
-mount (`SHM_SIZE=4g`), and the API is published on one host address (`BIND_ADDR=127.0.0.1`).
+The launchers run the server without `--privileged` or `--network=host`. The GPU is reached
+through `/dev/kfd`, `/dev/dri` and the render/video groups, and the API is published on one host
+address (`BIND_ADDR=127.0.0.1`). `--ipc=host` is kept as the one required exception: the TP=2 ROCm
+engine does not start with a private 4g `/dev/shm` (see [HARDENING.md](HARDENING.md)).
 Models, the Hugging Face cache, the repo (`/patches`) and libr4d are mounted read-only, and only
 the compile cache is writable. The server runs offline with no HF token. The image, repo commit
 and model revisions are pinned in `deploy-pins.env`.

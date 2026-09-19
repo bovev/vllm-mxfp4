@@ -19,10 +19,10 @@ serve container (serve-mxfp4.sh)
    ├── /r4d                     read-only           the pinned libr4d build
    ├── /cache                   writable            vllm / inductor / triton / aiter / hf_modules
    ├── BIND_ADDR:PORT           published           127.0.0.1:8080 by default
+   ├── --ipc=host               KEPT                required exception, see "Host IPC" below
    │
    ✕ --privileged               removed
    ✕ --network=host             removed (own network namespace, one published port)
-   ✕ --ipc=host                 removed (--shm-size 4g)
    ✕ runtime socket             never mounted (the launcher refuses to)
    ✕ Hugging Face downloads     HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1, no token
    ✕ telemetry                  VLLM_NO_USAGE_STATS=1, DO_NOT_TRACK=1, HF_HUB_DISABLE_TELEMETRY=1
@@ -30,6 +30,44 @@ serve container (serve-mxfp4.sh)
 
 These are kept for the first deployment (plan §9) and tested separately later:
 `--cap-add SYS_PTRACE` and `--security-opt seccomp=unconfined`.
+
+### Validated baseline (2026-09-19, TP=2)
+
+| Setting | Baseline |
+|---|---|
+| `--privileged` | **no** |
+| `--ipc=host` | **yes**: required by this TP=2/ROCm stack |
+| `--network=host` | **no** |
+| Explicit port publishing (`-p BIND_ADDR:PORT:PORT`) | **yes** |
+| `/models`, `/patches`, `/r4d` | read-only |
+| HF offline mode (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, no token) | **yes** |
+
+### Host IPC is a required exception
+
+The first hardened launch (all changes applied, private IPC with `--shm-size 4g`) failed. We then
+changed one variable only: `--shm-size 4g` went back to `--ipc=host`. `--privileged` stayed off,
+networking stayed bridged with the one published port, and the mounts stayed read-only. With that
+change the server came up. The log reached
+
+```text
+Application startup complete.
+API server: HTTP server started
+```
+
+so the engine finished initialising and the API was listening. The A/B result:
+
+```text
+private IPC + --shm-size 4g   -> FAIL
+--ipc=host                    -> WORKS
+```
+
+`--ipc=host` is therefore the launcher default (`IPC_HOST=1`). **Do not restore `--privileged` or
+`--network=host`.** Host IPC does not justify them. The other removals were all active in the
+working run, so each of them is validated.
+
+What stays open: only 4g was tested for a private `/dev/shm`. `IPC_HOST=0 SHM_SIZE=16g` is the
+retest if we ever want host IPC gone again. `verify-hardening.sh` reports `IpcMode=host` as a WARN
+(a known exception), not a FAIL.
 
 The patch step inside the container writes only to the image's `site-packages`. It never writes to
 `/patches`. The patched vLLM is recreated on every start from the read-only repo, so a
@@ -47,7 +85,8 @@ needed. Do not fall back to `--privileged` or host networking.
 |---|---|---|
 | `BIND_ADDR` | `127.0.0.1` | Host address the API is published on. Use the server's LAN IP for LAN access |
 | `ALLOW_ALL_INTERFACES` | `0` | Required to publish on `0.0.0.0` (only behind a host firewall) |
-| `SHM_SIZE` | `4g` | Private `/dev/shm`. Raise to `8g`/`16g` if RCCL or the engine runs short |
+| `IPC_HOST` | `1` | Keep `--ipc=host` (required, see above). `0` uses a private `/dev/shm` of `SHM_SIZE` (retest only) |
+| `SHM_SIZE` | `4g` | Private `/dev/shm` size when `IPC_HOST=0`. `4g` fails at TP=2; `8g`/`16g` untested |
 | `CAP_SYS_PTRACE` | `1` | `0` drops `--cap-add SYS_PTRACE` (second stage) |
 | `SECCOMP_UNCONFINED` | `1` | `0` uses the runtime's default seccomp profile (second stage) |
 | `CAP_DROP_ALL` | `0` | `1` adds `--cap-drop ALL` (third stage) |
@@ -81,7 +120,8 @@ libr4d stays pinned to the fixed commit `R4D_PIN` in `serve-mxfp4.sh`. Do not mo
    only `/cache` is writable.
 5. `./serve-mxfp4.sh` (or `DETACH=1`). The existing llama.cpp server stays on its own port
    (plan §21).
-6. `./verify-hardening.sh`: checks `Privileged=false`, network and IPC mode not `host`, the mount
+6. `./verify-hardening.sh`: checks `Privileged=false`, network mode not `host` (IPC mode `host` is a
+   WARN, the known exception), the mount
    modes, the published address, the offline env, the absence of an HF token, and `/health`.
 7. By hand: `sudo ss -lntp | grep 8080` shows only the intended address. From another machine the
    API must *not* answer while `BIND_ADDR=127.0.0.1`.
@@ -91,10 +131,11 @@ If step 5 or 8 fails, relax one knob, retry, and record the result in the table 
 
 | Change | Result | Date |
 |---|---|---|
-| `--privileged` removed | _untested_ | |
-| `--network=host` → `-p BIND_ADDR:PORT` | _untested_ | |
-| `--ipc=host` → `--shm-size 4g` | _untested_ | |
-| read-only mounts | _untested_ | |
+| `--privileged` removed | works (server up, with `--ipc=host`) | 2026-09-19 |
+| `--network=host` → `-p BIND_ADDR:PORT` | works (server up, with `--ipc=host`) | 2026-09-19 |
+| `--ipc=host` → `--shm-size 4g` | **fails**: engine does not finish startup. `--ipc=host` restored | 2026-09-19 |
+| read-only mounts | works (server up, with `--ipc=host`) | 2026-09-19 |
+| HF offline mode | works (server up, with `--ipc=host`) | 2026-09-19 |
 
 ## Second stage (after the server is stable)
 

@@ -117,9 +117,11 @@ Everything is an environment variable; these are the ones worth knowing.
   DRY_RUN=1                 print the container command and its security boundary instead of
                             running it (removes nothing)
 
-Container security boundary (HARDENING.md). No --privileged, --network=host or --ipc=host;
-change these ONE AT A TIME when testing, and record which one a failure needed.
-  SHM_SIZE=4g               /dev/shm size (replaces --ipc=host); raise to 8g/16g if RCCL needs it
+Container security boundary (HARDENING.md). No --privileged or --network=host. --ipc=host is
+the one required exception (TP=2/ROCm fails to start with a private 4g /dev/shm, 2026-09-19).
+Change these ONE AT A TIME when testing, and record which one a failure needed.
+  IPC_HOST=1                keep --ipc=host (required); 0 uses a private /dev/shm of SHM_SIZE
+  SHM_SIZE=4g               /dev/shm size when IPC_HOST=0 (4g fails; 8g/16g untested)
   CAP_SYS_PTRACE=1          keep --cap-add SYS_PTRACE; 0 drops it (second-stage test)
   SECCOMP_UNCONFINED=1      keep seccomp=unconfined; 0 uses the runtime default profile
   CAP_DROP_ALL=0            1 adds --cap-drop ALL (third-stage test; re-adds SYS_PTRACE if kept)
@@ -929,13 +931,14 @@ echo "[run] follow the log with: $RUNTIME logs -f $NAME    stop with: $RUNTIME s
 
 # ---------------------------------------------------------------- container security boundary
 # HARDENING.md has the reasoning; in short: GPU access is the two device nodes plus the render/
-# video groups, not --privileged; /dev/shm is a sized private mount, not the host IPC namespace;
-# the API is one published port on BIND_ADDR, not the host network namespace. SYS_PTRACE and
-# unconfined seccomp are KEPT by default (ROCm / AITER JIT / py-spy) and are the second-stage
-# tests: flip one knob at a time.
+# video groups, not --privileged; the API is one published port on BIND_ADDR, not the host
+# network namespace. Host IPC is the one required exception: with a private --shm-size 4g the
+# TP=2 ROCm engine never finished initialisation, with --ipc=host it serves (A/B, 2026-09-19).
+# IPC_HOST=0 is kept only to retest a private /dev/shm. SYS_PTRACE and unconfined seccomp are KEPT
+# by default (ROCm / AITER JIT / py-spy) and are the second-stage tests: flip one knob at a time.
 SHM_SIZE=${SHM_SIZE:-4g}
-# DEBUG (bisecting startup regression): host IPC restored in place of --shm-size "$SHM_SIZE".
-SEC_FLAGS=(--ipc=host -p "$BIND_ADDR:$PORT:$PORT" --label "$MANAGED_LABEL=1")
+if [ "${IPC_HOST:-1}" = 1 ]; then IPC_FLAGS=(--ipc=host); else IPC_FLAGS=(--shm-size "$SHM_SIZE"); fi
+SEC_FLAGS=("${IPC_FLAGS[@]}" -p "$BIND_ADDR:$PORT:$PORT" --label "$MANAGED_LABEL=1")
 if [ "${CAP_DROP_ALL:-0}" = 1 ]; then SEC_FLAGS+=(--cap-drop ALL); fi
 if [ "${CAP_SYS_PTRACE:-1}" = 1 ]; then SEC_FLAGS+=(--cap-add SYS_PTRACE); fi
 if [ "${SECCOMP_UNCONFINED:-1}" = 1 ]; then SEC_FLAGS+=(--security-opt seccomp=unconfined); fi

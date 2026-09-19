@@ -5,7 +5,7 @@
 #   NAME=other ./verify-hardening.sh      a different container
 #
 # Read-only: it inspects the container and probes the API, and changes nothing. Exits non-zero if
-# any FAIL line is printed. WARN lines are deliberate first-stage allowances (SYS_PTRACE, unconfined
+# any FAIL line is printed. WARN lines are deliberate allowances (host IPC, SYS_PTRACE, unconfined
 # seccomp) or things that need a human (the LAN / firewall checks in HARDENING.md).
 set -uo pipefail
 
@@ -37,10 +37,15 @@ echo "checking $RUNTIME container $NAME"
 [ "$(q '{{.HostConfig.Privileged}}')" = false ] && pass "Privileged=false" || fail "container is --privileged"
 net=$(q '{{.HostConfig.NetworkMode}}')
 [ "$net" != host ] && pass "NetworkMode=$net" || fail "NetworkMode=host"
+# Host IPC is the one documented exception (HARDENING.md): TP=2/ROCm does not start without it.
 ipc=$(q '{{.HostConfig.IpcMode}}')
-[ "$ipc" != host ] && pass "IpcMode=${ipc:-private}" || fail "IpcMode=host"
-shm=$(q '{{.HostConfig.ShmSize}}')
-[ -n "$shm" ] && [ "$shm" -gt 0 ] 2>/dev/null && pass "ShmSize=$((shm / 1024 / 1024)) MiB" || warn "ShmSize not reported"
+if [ "$ipc" = host ]; then
+  warn "IpcMode=host (required exception for TP=2/ROCm; see HARDENING.md)"
+else
+  pass "IpcMode=${ipc:-private}"
+  shm=$(q '{{.HostConfig.ShmSize}}')
+  [ -n "$shm" ] && [ "$shm" -gt 0 ] 2>/dev/null && pass "ShmSize=$((shm / 1024 / 1024)) MiB" || warn "ShmSize not reported"
+fi
 [ "$(q '{{index .Config.Labels "io.vllm-mxfp4.managed"}}')" = 1 ] && pass "started by serve-mxfp4.sh (managed label)" \
   || warn "no io.vllm-mxfp4.managed label -- not started by the hardened launcher?"
 

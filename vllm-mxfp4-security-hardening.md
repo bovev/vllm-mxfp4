@@ -184,6 +184,10 @@ A dedicated Docker shared-memory allocation provides the memory required by infe
 
 Only restore `--ipc=host` if testing demonstrates a real requirement.
 
+> **Outcome (2026-09-19):** testing showed the requirement. With `--shm-size 4g` the TP=2 ROCm
+> engine did not finish startup. With `--ipc=host`, and everything else still hardened, it served.
+> `--ipc=host` is kept. `--privileged` and `--network=host` stay removed. See `HARDENING.md`.
+
 ---
 
 ## 5. Replace host networking with explicit port publishing
